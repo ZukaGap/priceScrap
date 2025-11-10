@@ -1,402 +1,448 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+A multi-domain price scraper for e-commerce sites.
+
+This script can be run in two ways:
+1. Single URL Mode: python3 priceScrap.py 'http://example.com/product/123'
+2. Batch Mode: python3 priceScrap.py 'targetURL.json'
+
+It scrapes product data (SKU, title, price), saves an HTML snapshot,
+and logs the price history in two separate Excel files: one for the
+individual item's history and one for the domain's overall summary.
+"""
+
 import sys
 import os
-import requests
+import json
 import re
-import json  # <-- ADDED IMPORT
+import datetime
+import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
-from datetime import datetime
 import openpyxl
-from openpyxl.styles import PatternFill
-from openpyxl.utils.exceptions import InvalidFileException
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
 
-# --- Helper Function to Clean Prices ---
+# --- Helper Functions ---
 
-def clean_price(price_text):
-    """
-    Cleans text like "1,299.99 ₾" or "$49.50" into a simple float (e.g., 1299.99 or 49.50)
-    """
-    if price_text is None:
+def get_domain_name(url):
+    """Extracts the simple domain name (e.g., 'nova.ge') from a URL."""
+    try:
+        parsed_url = urlparse(url)
+        domain_parts = parsed_url.netloc.split('.')
+        if len(domain_parts) >= 2:
+            # Join the last two parts, e.g., 'www.domino.com.ge' -> 'domino.com.ge'
+            return '.'.join(domain_parts[-(len(domain_parts)-1) if 'www' in domain_parts[0] else -2:])
+        return parsed_url.netloc
+    except Exception as e:
+        print(f"Error parsing domain from URL: {url} - {e}")
+        return None
+
+def clean_price(price_str):
+    """Converts a price string (e.g., '164,00 ₾') to a float (e.g., 164.00)."""
+    if price_str is None:
         return None
     try:
-        # Remove all non-digit characters except for the decimal point
-        # This will handle "1,299.99 ₾" -> "1299.99"
-        cleaned_text = re.sub(r"[^0-9.]", "", price_text)
-        
-        # Handle cases where multiple dots might exist after cleaning, e.g., "1.299.99"
-        parts = cleaned_text.split('.')
-        if len(parts) > 2:
-            # Join all parts except the last one, then add the last part back
-            cleaned_text = "".join(parts[:-1]) + "." + parts[-1]
-            
-        return float(cleaned_text)
+        # Remove currency symbols, whitespace, and replace comma with a dot
+        cleaned_str = re.sub(r'[^\d,\.]', '', price_str).replace(',', '.')
+        return float(cleaned_str)
     except (ValueError, TypeError):
-        print(f"Warning: Could not convert price text '{price_text}' to a number.")
         return None
 
-# --- Main Scraping and File Function ---
+def get_modification_time():
+    """Returns the current date and time as a string."""
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def process_url(url):
+# --- Parser Functions ---
+
+def parse_nova_ge(soup):
+    """Scrapes product data from a nova.ge BeautifulSoup object."""
+    data = {'sku': None, 'item_id': None, 'new_price': None, 'old_price': None, 'title': None, 'error': None}
+    
+    try:
+        # 1. Find SKU and Item ID
+        sku_parent_element = soup.find(class_="sku")
+        if not sku_parent_element:
+            data['error'] = "Could not find SKU parent element with class='sku'."
+            return data
+            
+        sku_span = sku_parent_element.find("span", id=re.compile(r"^sku-"))
+        if not sku_span:
+            data['error'] = "Could not find SKU span with id starting with 'sku-'."
+            return data
+            
+        data['sku'] = sku_span.get_text(strip=True)
+        data['item_id'] = sku_span['id'].replace('sku-', '')
+        
+        # 2. Find Prices using the Item ID
+        old_price_tag = soup.find(class_=f"product__oldprice old-price-value-{data['item_id']}")
+        new_price_tag = soup.find(class_=f"product__newprice price-value-{data['item_id']}")
+        
+        if new_price_tag:
+            data['new_price'] = clean_price(new_price_tag.get_text(strip=True))
+            if old_price_tag:
+                data['old_price'] = clean_price(old_price_tag.get_text(strip=True))
+            else:
+                # If there's a new price but no old price, it's not a sale
+                data['old_price'] = None
+        else:
+            # If no new_price_tag, the main price is the old_price_tag (or a single non-sale price)
+            # This logic might need adjustment based on non-sale items
+            single_price_tag = soup.find(class_=re.compile(r"price-value-"))
+            if single_price_tag:
+                 data['new_price'] = clean_price(single_price_tag.get_text(strip=True))
+            data['old_price'] = None
+
+        # 3. Find Title
+        title_tag = soup.find(class_="product__details--title")
+        if title_tag and title_tag.h1:
+            data['title'] = title_tag.h1.get_text(strip=True)
+        else:
+            data['error'] = "Could not find product title."
+            return data
+            
+        return data
+
+    except Exception as e:
+        data['error'] = f"An unexpected error occurred during nova.ge parsing: {e}"
+        return data
+
+def parse_domino_com_ge(soup):
+    """Scrapes product data from a domino.com.ge BeautifulSoup object."""
+    data = {'sku': None, 'item_id': None, 'new_price': None, 'old_price': None, 'title': None, 'error': None}
+    
+    try:
+        # 1. Find SKU and Item ID
+        sku_span = soup.find("span", id=re.compile(r"^product_code_"))
+        if not sku_span:
+            data['error'] = "Could not find SKU span with id starting with 'product_code_'."
+            return data
+
+        # Get SKU by finding the first text node, ignoring comments
+        data['sku'] = sku_span.find(string=True, recursive=False).strip()
+        
+        # Get Item ID from the span's 'id' attribute
+        data['item_id'] = sku_span['id'].replace('product_code_', '')
+
+        # 2. Find Prices using the Item ID
+        new_price_tag = soup.find("span", id=f"sec_discounted_price_{data['item_id']}")
+        old_price_tag = soup.find("span", id=f"sec_list_price_{data['item_id']}")
+
+        if new_price_tag:
+            # This means it's a sale item
+            data['new_price'] = clean_price(new_price_tag.get_text(strip=True))
+            if old_price_tag:
+                data['old_price'] = clean_price(old_price_tag.get_text(strip=True))
+        elif old_price_tag:
+            # This means it's not on sale, and 'old_price_tag' is the main price
+            data['new_price'] = clean_price(old_price_tag.get_text(strip=True))
+            data['old_price'] = None
+        else:
+            # Fallback if only one price (not 'list' or 'discounted') is present
+            price_tag = soup.find("span", id=re.compile(r"price_"))
+            if price_tag:
+                data['new_price'] = clean_price(price_tag.get_text(strip=True))
+            data['old_price'] = None
+
+        # 3. Find Title
+        title_container = soup.find(class_="ut2-pb__title")
+        if title_container and title_container.h1 and title_container.h1.bdi:
+            data['title'] = title_container.h1.bdi.get_text(strip=True)
+        elif title_container and title_container.h1: # Fallback
+            data['title'] = title_container.h1.get_text(strip=True)
+        else:
+            data['error'] = "Could not find product title."
+            return data
+            
+        return data
+
+    except Exception as e:
+        data['error'] = f"An unexpected error occurred during domino.com.ge parsing: {e}"
+        return data
+
+# --- Excel Functions ---
+
+def style_excel_headers(ws):
+    """Applies bold font and light grey fill to the first row of a worksheet."""
+    header_fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+    header_font = Font(bold=True)
+    header_align = Alignment(horizontal="center")
+    
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_align
+
+def adjust_excel_columns(ws):
+    """Adjusts column widths for better readability."""
+    for col in ws.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = (max_length + 2)
+        if adjusted_width > 50: # Cap width
+            adjusted_width = 50
+        ws.column_dimensions[column].width = adjusted_width
+
+def update_item_excel(item_dir, sku, item_id, title, new_price, old_price, url, mod_time):
     """
-    Main function to scrape a URL, save HTML, and update Excel files.
+    Updates or creates the item-specific Excel log.
+    Logs every scrape attempt.
     """
-    
-    # --- 1. SETUP AND NETWORK REQUEST ---
-    print(f"Processing URL: {url}")
-    
-    # Set headers to mimic a real browser
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.88 Safari/537.36"
-    }
-    
-    # Get current timestamp for filenames and logs
-    now = datetime.now()
-    mod_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    file_time_str = now.strftime("%Y-%m-%d_%H-%M-%S")
-    
-    # Get base directory (where the script is located)
-    base_dir = os.getcwd()
-    
-    # Parse domain from URL
-    parsed_url = urlparse(url)
-    domain = parsed_url.netloc
-    if not domain:
-        raise ValueError("Invalid URL provided. Could not determine domain.")
-        
-    # Create domain directory (e.g., /priceScrap/nova.ge/)
-    domain_dir = os.path.join(base_dir, domain)
-    os.makedirs(domain_dir, exist_ok=True)
-    
-    # Fetch the webpage content
-    response = requests.get(url, headers=HEADERS)
-    response.raise_for_status()  # Raise an error if the request failed (e.g., 404, 500)
-    html_content = response.text
-    
-    # --- 2. PARSE HTML (BeautifulSoup) ---
-    print("Parsing HTML content...")
-    soup = BeautifulSoup(html_content, "html.parser")
-    
-    # 2a. Find SKU and [ID]
-    #
-    # --- *** MODIFIED SECTION *** ---
-    #
-    # First, find the parent element with class="sku" (which is a <p> tag in this case)
-    sku_parent_element = soup.find(class_="sku")
-    
-    if not sku_parent_element:
-        raise ValueError("Could not find the parent element with class='sku'. Cannot proceed.")
-    
-    # Now, find the <span> tag *inside* that parent element
-    sku_span = sku_parent_element.find("span")
-    
-    if not sku_span:
-        raise ValueError("Found element with class='sku', but could not find the nested <span> tag. Cannot proceed.")
-        
-    # The SKU is the text *inside* the span (e.g., "1823396")
-    sku = sku_span.get_text(strip=True)
-    
-    # The [ID] is part of the span's 'id' attribute (e.g., "sku-28859")
-    sku_id_attr = sku_span.get("id", "")
-    
-    item_id = None
-    if sku_id_attr.startswith("sku-"):
-        item_id = sku_id_attr.split('-')[-1] # This will get "28859"
-    
-    if not item_id:
-        raise ValueError("Could not extract [ID] from SKU span's id attribute. Cannot proceed.")
-    #
-    # --- *** END OF MODIFIED SECTION *** ---
-    #
-    
-    print(f"Found SKU: {sku} and Item ID: {item_id}")
-    
-    # 2b. Find Title
-    # find class="product__details--title" where nested h1 and get title
-    title_div = soup.find(class_="product__details--title")
-    title_h1 = title_div.find("h1") if title_div else None
-    title = title_h1.get_text(strip=True) if title_h1 else "No Title Found"
-    
-    # 2c. Find Prices
-    # find class="product__oldprice old-price-value-[ID]"
-    # find class="product__newprice price-value-[ID]"
-    old_price_span = soup.find(class_=f"product__oldprice old-price-value-{item_id}")
-    new_price_span = soup.find(class_=f"product__newprice price-value-{item_id}")
-    
-    old_price_text = old_price_span.get_text(strip=True) if old_price_span else None
-    new_price_text = new_price_span.get_text(strip=True) if new_price_span else None
-    
-    # 2d. Clean prices into numbers
-    oldPrice = clean_price(old_price_text)
-    newPrice = clean_price(new_price_text)
-    
-    # Determine the "current price" for min/max logic
-    # If it's on sale, newPrice is current. Otherwise, oldPrice is current.
-    current_price = newPrice if newPrice is not None else oldPrice
-    if current_price is None:
-        print("Warning: Could not determine any price for this item.")
-        
-    print(f"Title: {title}")
-    print(f"Old Price: {oldPrice} | New/Sale Price: {newPrice}")
-
-    # --- 3. SAVE HTML FILE ---
-    # Create [ID] directory (e.g., /priceScrap/nova.ge/28859/)
-    item_dir = os.path.join(domain_dir, item_id)
-    os.makedirs(item_dir, exist_ok=True)
-    
-    # Save HTML file: sku-[ID]-[modifidata].html
-    html_filename = f"sku-{item_id}-{file_time_str}.html"
-    html_filepath = os.path.join(item_dir, html_filename)
-    
-    with open(html_filepath, "w", encoding="utf-8") as f:
-        f.write(html_content)
-    print(f"HTML content saved to: {html_filepath}")
-
-    # --- 4. UPDATE INDIVIDUAL ITEM EXCEL (Historical Log) ---
-    print(f"Updating individual item log: sku-{item_id}.xlsx")
-    item_excel_path = os.path.join(item_dir, f"sku-{item_id}.xlsx")
-    item_headers = ["SKU", "newPrice", "oldPrice", "title", "url website", "modified data"]
+    excel_file = os.path.join(item_dir, f"sku-{item_id}.xlsx")
+    headers = ["SKU", "newPrice", "oldPrice", "title", "URL", "scrapeTime"]
     
     # Define the green fill for sale prices
     green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
     
     try:
-        # Try to load existing workbook
-        wb_item = openpyxl.load_workbook(item_excel_path)
-        ws_item = wb_item.active
-    except (FileNotFoundError, InvalidFileException):
-        # Create new one if it doesn't exist or is corrupt
-        wb_item = openpyxl.Workbook()
-        ws_item = wb_item.active
-        ws_item.append(item_headers)
-
-    # Append the new data
-    data_row = [sku, newPrice, oldPrice, title, url, mod_time_str]
-    ws_item.append(data_row)
-    
-    # Color the `newPrice` cell if it exists
-    if newPrice is not None:
-        new_price_cell = ws_item.cell(row=ws_item.max_row, column=2) # Column 2 = "B"
-        new_price_cell.fill = green_fill
-        
-    wb_item.save(item_excel_path)
-    wb_item.close()
-
-    # --- 5. UPDATE DOMAIN SUMMARY EXCEL (Master List) ---
-    print(f"Updating domain summary log: {domain}-summary.xlsx")
-    summary_excel_path = os.path.join(domain_dir, f"{domain}-summary.xlsx")
-    summary_headers = ["SKU", "newPrice", "oldPrice", "title", "max price", "min price", "url website", "last modified data"]
-
-    try:
-        wb_summary = openpyxl.load_workbook(summary_excel_path)
-        ws_summary = wb_summary.active
-    except (FileNotFoundError, InvalidFileException):
-        wb_summary = openpyxl.Workbook()
-        ws_summary = wb_summary.active
-        ws_summary.append(summary_headers)
-
-    # Find if this SKU already exists in the summary file
-    sku_row_index = None
-    # Iterate rows, starting from row 2 (after header)
-    for row_idx, row in enumerate(ws_summary.iter_rows(min_row=2, max_col=1), start=2):
-        if row[0].value == sku:
-            sku_row_index = row_idx
-            break
-            
-    if sku_row_index:
-        # --- SKU EXISTS: UPDATE THE ROW ---
-        print(f"SKU {sku} found in summary. Updating row {sku_row_index}...")
-        
-        # Get old min/max prices
-        try:
-            old_max = float(ws_summary.cell(row=sku_row_index, column=5).value)
-        except (ValueError, TypeError):
-            old_max = current_price # Set to current if old value is invalid
-            
-        try:
-            old_min = float(ws_summary.cell(row=sku_row_index, column=6).value)
-        except (ValueError, TypeError):
-            old_min = current_price # Set to current if old value is invalid
-
-        # Calculate new min/max
-        new_max = old_max
-        new_min = old_min
-        if current_price is not None:
-            if old_max is None:
-                new_max = current_price
-            else:
-                new_max = max(old_max, current_price)
-                
-            if old_min is None:
-                new_min = current_price
-            else:
-                new_min = min(old_min, current_price)
-            
-        # Update row data
-        ws_summary.cell(row=sku_row_index, column=2, value=newPrice) # newPrice
-        ws_summary.cell(row=sku_row_index, column=3, value=oldPrice) # oldPrice
-        ws_summary.cell(row=sku_row_index, column=4, value=title) # title
-        ws_summary.cell(row=sku_row_index, column=5, value=new_max) # max price
-        ws_summary.cell(row=sku_row_index, column=6, value=new_min) # min price
-        ws_summary.cell(row=sku_row_index, column=7, value=url) # url
-        ws_summary.cell(row=sku_row_index, column=8, value=mod_time_str) # last modified
-        
-        # Update cell color
-        new_price_cell = ws_summary.cell(row=sku_row_index, column=2)
-        if newPrice is not None:
-            new_price_cell.fill = green_fill
+        if not os.path.exists(excel_file):
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "PriceHistory"
+            ws.append(headers)
+            style_excel_headers(ws)
         else:
-            new_price_cell.fill = PatternFill(fill_type=None) # Remove fill if no longer on sale
+            wb = openpyxl.load_workbook(excel_file)
+            ws = wb.active
+        
+        # Add new data
+        row_data = [sku, new_price, old_price, title, url, mod_time]
+        ws.append(row_data)
+        
+        # Style the new row
+        new_row_idx = ws.max_row
+        if old_price and new_price:
+            ws[f'B{new_row_idx}'].fill = green_fill # Style 'newPrice'
+        
+        adjust_excel_columns(ws)
+        wb.save(excel_file)
+        
+    except Exception as e:
+        print(f"Error updating item Excel '{excel_file}': {e}")
+
+def update_domain_excel(domain_dir, domain_name, sku, item_id, title, new_price, old_price, url, mod_time):
+    """
+    Updates or creates the master domain summary Excel file.
+    Keeps only the latest data, min/max prices.
+    """
+    excel_file = os.path.join(domain_dir, f"{domain_name}-summary.xlsx")
+    headers = [
+        "SKU", "item_ID", "newPrice", "oldPrice", "title", 
+        "minPrice", "maxPrice", "URL", "lastModified"
+    ]
+    
+    # Define the green fill for sale prices
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    
+    try:
+        if not os.path.exists(excel_file):
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "ProductSummary"
+            ws.append(headers)
+            style_excel_headers(ws)
+        else:
+            wb = openpyxl.load_workbook(excel_file)
+            ws = wb.active
             
-    else:
-        # --- SKU IS NEW: APPEND A NEW ROW ---
-        print(f"SKU {sku} is new. Appending to summary...")
+        # Find existing row for this item_ID
+        target_row = None
+        for row in range(2, ws.max_row + 1):
+            if ws.cell(row=row, column=2).value == item_id: # Column B is item_ID
+                target_row = row
+                break
         
-        # Set min/max to the current price since it's the first entry
-        new_row_data = [sku, newPrice, oldPrice, title, current_price, current_price, url, mod_time_str]
-        ws_summary.append(new_row_data)
+        current_min_price = None
+        current_max_price = None
         
-        # Color the `newPrice` cell
-        if newPrice is not None:
-            new_price_cell = ws_summary.cell(row=ws_summary.max_row, column=2)
-            new_price_cell.fill = green_fill
+        if target_row:
+            # Get existing min/max prices
+            current_min_price = ws.cell(row=target_row, column=6).value
+            current_max_price = ws.cell(row=target_row, column=7).value
+        
+        # Determine new min/max
+        if new_price is not None:
+            new_min = min(current_min_price, new_price) if current_min_price is not None else new_price
+            new_max = max(current_max_price, new_price) if current_max_price is not None else new_price
+        else:
+            new_min = current_min_price
+            new_max = current_max_price
 
-    # Save and close the summary workbook
-    wb_summary.save(summary_excel_path)
-    wb_summary.close()
+        # Prepare new row data
+        row_data = [
+            sku, item_id, new_price, old_price, title,
+            new_min, new_max, url, mod_time
+        ]
 
-# --- SCRIPT EXECUTION (MODIFIED FOR BATCH PROCESSING) ---
+        if target_row:
+            # Update existing row
+            for col_idx, value in enumerate(row_data, 1):
+                ws.cell(row=target_row, column=col_idx, value=value)
+        else:
+            # Add new row
+            ws.append(row_data)
+            target_row = ws.max_row
+            
+        # Style the row
+        if old_price and new_price:
+            ws[f'C{target_row}'].fill = green_fill # Style 'newPrice'
+        else:
+            ws[f'C{target_row}'].fill = PatternFill(fill_type=None) # Clear fill if not on sale
+
+        adjust_excel_columns(ws)
+        wb.save(excel_file)
+
+    except Exception as e:
+        print(f"Error updating domain Excel '{excel_file}': {e}")
+
+
+# --- Main Scraper Function ---
+
+def process_url(url):
+    """
+    Main function to process a single URL.
+    - Fetches HTML
+    - Calls the correct domain parser
+    - Saves HTML
+    - Updates Excel files
+    """
+    print(f"\n--- Processing: {url} ---")
+    
+    try:
+        # 1. Get Domain
+        domain_name = get_domain_name(url)
+        if not domain_name:
+            print(f"FAILED: Could not determine domain for {url}")
+            return False
+
+        # 2. Fetch HTML
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers)
+        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+        html_content = response.text
+        soup = BeautifulSoup(html_content, 'html.parser')
+
+        # 3. Call Correct Parser based on domain
+        scraped_data = None
+        if domain_name == 'nova.ge':
+            scraped_data = parse_nova_ge(soup)
+        elif domain_name == 'domino.com.ge':
+            scraped_data = parse_domino_com_ge(soup)
+        else:
+            print(f"FAILED: No parser available for domain: {domain_name}")
+            return False
+            
+        # 4. Check for parsing errors
+        if scraped_data.get('error'):
+            print(f"A parsing error occurred: {scraped_data['error']}")
+            raise Exception(scraped_data['error']) # Raise to trigger failure message
+            
+        sku = scraped_data['sku']
+        item_id = scraped_data['item_id']
+        new_price = scraped_data['new_price']
+        old_price = scraped_data['old_price']
+        title = scraped_data['title']
+        
+        if not all([sku, item_id, title]):
+             raise Exception("Missing essential data (SKU, Item ID, or Title) after parsing.")
+
+        print(f"  > Found SKU: {sku}")
+        print(f"  > Found Item ID: {item_id}")
+        print(f"  > Found Title: {title}")
+        print(f"  > Found Price: {new_price} (Old: {old_price})")
+
+        # 5. Create Directories
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        domain_dir = os.path.join(base_dir, domain_name)
+        item_dir = os.path.join(domain_dir, item_id)
+        os.makedirs(item_dir, exist_ok=True)
+        
+        mod_time = get_modification_time()
+        mod_time_file_safe = mod_time.replace(':', '-').replace(' ', '_')
+
+        # 6. Save HTML
+        html_filename = f"sku-{item_id}_{mod_time_file_safe}.html"
+        html_filepath = os.path.join(item_dir, html_filename)
+        with open(html_filepath, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+
+        # 7. Update Excel Files
+        # Update the item-specific log
+        update_item_excel(item_dir, sku, item_id, title, new_price, old_price, url, mod_time)
+        
+        # Update the master domain summary
+        update_domain_excel(domain_dir, domain_name, sku, item_id, title, new_price, old_price, url, mod_time)
+
+        print(f"SUCCESS: Successfully processed and logged data for Item ID {item_id}.")
+        return True
+
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP Error: {e.response.status_code} for URL: {url}")
+    except requests.exceptions.RequestException as e:
+        print(f"Request Error: {e} for URL: {url}")
+    except Exception as e:
+        print("\n" + "="*50)
+        print("--- SCRIPT FAILED ---")
+        print(f"An error occurred: {e}")
+        print("This usually means the website's HTML structure has changed,")
+        print("and the script couldn't find the required elements (like 'sku', 'price', etc.).")
+        print("="*50 + "\n")
+    
+    return False
+
+# --- Main Execution ---
 
 if __name__ == "__main__":
-    # This block runs when you execute: python3 priceScrap.py [ARGUMENT]
-    
-    # Check if an argument is provided
     if len(sys.argv) != 2:
-        print("--- ERROR: Invalid Usage ---")
-        print("Please provide a single URL or a path to a .json file.")
-        print("\nExample (Single URL):")
-        print("  python3 priceScrap.py 'https://www.example.com/product/123'")
-        print("\nExample (Batch File):")
-        print("  python3 priceScrap.py targetURL.json")
-        sys.exit(1) # Exit with a (1) error code
-        
+        print("Usage: python3 priceScrap.py '<URL>' OR 'targetURL.json'")
+        sys.exit(1)
+
     argument = sys.argv[1]
-    
-    # --- BATCH MODE: Argument is a .json file ---
+
     if argument.endswith('.json'):
-        print(f"--- Running in BATCH mode from file: {argument} ---")
-        urls_to_process = []
-        
-        # --- 1. Read and Parse JSON file ---
+        # Batch Mode
+        print(f"Batch mode activated. Reading from '{argument}'...")
         try:
-            with open(argument, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            with open(argument, 'r') as f:
+                urls = json.load(f)
             
-            # Check if it's a list of objects, as per your example
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict) and "url" in item:
-                        urls_to_process.append(item["url"])
-                    else:
-                        print(f"Warning: Skipping invalid item in JSON list: {item}")
-            else:
-                print(f"Error: JSON file must contain a list of objects, e.g., [ {{'url': '...'}} ]")
+            if not isinstance(urls, list):
+                print(f"Error: JSON file '{argument}' must contain a list of objects.")
                 sys.exit(1)
+
+            total = len(urls)
+            success_count = 0
+            
+            for i, item in enumerate(urls, 1):
+                if not isinstance(item, dict) or 'url' not in item:
+                    print(f"Skipping invalid item in JSON: {item}")
+                    continue
                 
+                url = item['url']
+                print(f"\n[{i}/{total}]")
+                if process_url(url):
+                    success_count += 1
+            
+            print("\n--- Batch Run Complete ---")
+            print(f"Successfully processed: {success_count} / {total}")
+
         except FileNotFoundError:
-            print(f"--- SCRIPT FAILED ---")
-            print(f"Error: The file '{argument}' was not found.")
-            sys.exit(1)
+            print(f"Error: JSON file not found at '{argument}'")
         except json.JSONDecodeError:
-            print(f"--- SCRIPT FAILED ---")
-            print(f"Error: The file '{argument}' contains invalid JSON.")
-            print("Please check the file for syntax errors (e.g., missing commas, brackets).")
-            sys.exit(1)
+            print(f"Error: Could not decode JSON from '{argument}'. Check for syntax errors.")
         except Exception as e:
-            print(f"--- SCRIPT FAILED ---")
-            print(f"An error occurred while reading the file: {e}")
-            sys.exit(1)
-
-        if not urls_to_process:
-            print("No valid URLs found in the JSON file. Exiting.")
-            sys.exit(0)
-            
-        print(f"Found {len(urls_to_process)} URLs to process...")
-        print("=" * 50)
-        
-        # --- 2. Process each URL from the list ---
-        success_count = 0
-        fail_count = 0
-        
-        for i, url in enumerate(urls_to_process, 1):
-            print(f"Processing URL {i} of {len(urls_to_process)}: {url}")
-            try:
-                process_url(url)
-                print("--- URL processed successfully ---")
-                success_count += 1
-                
-            # Individual error handling so one bad URL doesn't stop the batch
-            except requests.exceptions.HTTPError as e:
-                print(f"--- FAILED (HTTP Error): {e} ---")
-                fail_count += 1
-            except (ValueError, AttributeError) as e:
-                print(f"--- FAILED (Parsing Error): {e} ---")
-                fail_count += 1
-            except Exception as e:
-                print(f"--- FAILED (Unexpected Error): {e} ---")
-                fail_count += 1
-            print("-" * 50) # Add a separator between items
-            
-        # --- 3. Print final summary ---
-        print("\n" + "="*50)
-        print("--- BATCH PROCESSING FINISHED ---")
-        print(f"Successfully processed: {success_count}")
-        print(f"Failed to process:     {fail_count}")
-        print("="*50)
-
-    # --- SINGLE URL MODE: Argument is not a .json file ---
+            print(f"An error occurred during batch processing: {e}")
+    
     else:
-        print(f"--- Running in SINGLE URL mode ---")
-        url_to_scrape = argument
-        try:
-            # Run the main function
-            process_url(url_to_scrape)
-            
-            # If it gets here, everything worked
-            print("\n" + "="*50)
-            print("--- SCRIPT FINISHED SUCCESSFULLY ---")
-            print("="*50)
-            
-        except requests.exceptions.HTTPError as e:
-            print("\n" + "="*50)
-            print("--- SCRIPT FAILED ---")
-            print(f"An HTTP error occurred: {e}")
-            print("The website might be down, or it blocked the request (e.g., 403 Forbidden, 404 Not Found).")
-            print("="*50)
-            sys.exit(1)
-            
-        except requests.exceptions.RequestException as e:
-            print("\n" + "="*50)
-            print("--- SCRIPT FAILED ---")
-            print(f"A network error occurred: {e}")
-            print("Check your internet connection or the URL.")
-            print("="*50)
-            sys.exit(1)
-            
-        except (ValueError, AttributeError) as e:
-            print("\n" + "="*50)
-            print("--- SCRIPT FAILED ---")
-            print(f"A parsing error occurred: {e}")
-            print("This usually means the website's HTML structure has changed,")
-            print("and the script couldn't find the required elements (like 'sku', 'price', etc.).")
-            print("="*50)
-            sys.exit(1)
-            
-        except Exception as e:
-            # Catch-all for any other unexpected errors
-            print("\n" + "="*50)
-            print("--- SCRIPT FAILED ---")
-            print(f"An unexpected error occurred: {e}")
-            import traceback
-            traceback.print_exc() # Print detailed error info
-            print("="*50)
-            sys.exit(1)
+        # Single URL Mode
+        process_url(argument)
