@@ -80,13 +80,17 @@ python priceScrap.py 'https://nova.ge/product-1'
 Create a `targetURL.json` file in the same directory as the script with your list of URLs:
 
 ```json
-{
-  "urls": [
-    "https://nova.ge/product-1",
-    "https://nova.ge/product-2",
-    "https://nova.ge/product-3"
-  ]
-}
+[
+  {
+    "url": "https://nova.ge/product-1"
+  },
+  {
+    "url": "https://nova.ge/product-2"
+  },
+  {
+    "url": "https://nova.ge/product-3"
+  }
+]
 ```
 
 Then run the script without any arguments:
